@@ -57,8 +57,9 @@ async def run_connection_test():
         await connection.connect()
         step("rpc_connect", True, "rpc connection opened")
 
-        # The make-or-break step: full terminal sync over websocket
-        await connection.wait_synchronized({"timeoutInSeconds": 120})
+        # The make-or-break step: full terminal sync over websocket.
+        # SDK 29.x expects timeout as a plain number of seconds (not a dict).
+        await connection.wait_synchronized(120)
         step("wait_synchronized", True, "terminal synchronized")
 
         info = await connection.get_account_information()
