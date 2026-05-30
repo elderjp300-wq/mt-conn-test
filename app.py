@@ -1,17 +1,32 @@
 """
-MetaApi Connection Test — read-only.
-A tiny web service for Railway. Hitting /test runs a one-shot connection check:
-connect to the account, read balance, list gold symbols, read a price.
-NO orders are placed. This only proves the websocket holds from this host.
+STAGE 1 — Single Test Order (manual, read+write proof)
+=============================================================================
+Goal: prove we can PLACE an order on the Exness MT5 demo via MetaApi, see it,
+and cancel it. This is the first time code WRITES to the trading account.
 
-Environment variables required (set in Railway, never in code):
-  METAAPI_TOKEN       - your MetaApi access token
-  METAAPI_ACCOUNT_ID  - your account id (4e2294fd-...)
+Safety design:
+  - XAUUSDm only (the confirmed gold symbol)
+  - Fixed tiny volume (0.01 lots) — NO risk-based sizing yet (that's Stage 2)
+  - The limit is placed FAR BELOW current price so it CANNOT fill during the
+    test (a buy limit only triggers if price drops to it; we put it ~12% below)
+  - 24h expiry attached, so even if forgotten it auto-cancels
+  - Nothing runs on a loop; every action is a manual URL hit
+
+Endpoints:
+  GET /                  -> info
+  GET /price             -> current XAUUSDm price (read-only sanity check)
+  GET /place_test_order  -> place ONE safe buy-limit, returns order id + details
+  GET /orders            -> list current pending orders
+  GET /cancel/<order_id> -> cancel a specific pending order
+
+Environment variables (set in Railway, never in code):
+  METAAPI_TOKEN, METAAPI_ACCOUNT_ID
 """
 
 import os
 import asyncio
 import traceback
+from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify
 
 app = Flask(__name__)
@@ -19,102 +34,177 @@ app = Flask(__name__)
 TOKEN = os.getenv("METAAPI_TOKEN", "")
 ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "")
 
+SYMBOL = "XAUUSDm"          # confirmed gold symbol on this Exness demo
+TEST_VOLUME = 0.01          # smallest lot; fixed for the test (no sizing yet)
+SAFE_DISTANCE_PCT = 0.12    # place limit 12% below price so it can't fill
+TEST_RR = 3.0               # 3R target, matching the strategy
 
-async def run_connection_test():
+
+async def _with_connection(do):
+    """Open an RPC connection, run `do(connection)`, always clean up."""
     from metaapi_cloud_sdk import MetaApi
-    result = {"steps": []}
-
-    def step(name, ok, detail=""):
-        result["steps"].append({"step": name, "ok": ok, "detail": str(detail)})
-
-    if not TOKEN or not ACCOUNT_ID:
-        step("env_vars", False, "METAAPI_TOKEN or METAAPI_ACCOUNT_ID not set")
-        result["success"] = False
-        return result
-
-    api = None
-    connection = None
+    api = MetaApi(TOKEN)
+    account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
+    if account.state != "DEPLOYED":
+        await account.deploy()
+    await account.wait_connected()
+    connection = account.get_rpc_connection()
+    await connection.connect()
+    await connection.wait_synchronized(120)
     try:
-        api = MetaApi(TOKEN)
-        step("sdk_init", True, "MetaApi client created")
-
-        account = await api.metatrader_account_api.get_account(ACCOUNT_ID)
-        step("get_account", True, f"state={account.state} conn={account.connection_status}")
-
-        # Ensure deployed (no-op if already deployed)
-        try:
-            if account.state != "DEPLOYED":
-                await account.deploy()
-                step("deploy", True, "deploy requested")
-        except Exception as e:
-            step("deploy", True, f"skip ({e})")
-
-        # Wait for the account to be connected to the broker
-        await account.wait_connected()
-        step("wait_connected", True, "account connected to broker")
-
-        connection = account.get_rpc_connection()
-        await connection.connect()
-        step("rpc_connect", True, "rpc connection opened")
-
-        # The make-or-break step: full terminal sync over websocket.
-        # SDK 29.x expects timeout as a plain number of seconds (not a dict).
-        await connection.wait_synchronized(120)
-        step("wait_synchronized", True, "terminal synchronized")
-
-        info = await connection.get_account_information()
-        result["account"] = {
-            "balance": info.get("balance"),
-            "currency": info.get("currency"),
-            "equity": info.get("equity"),
-            "leverage": info.get("leverage"),
-            "broker": info.get("broker"),
-        }
-        step("account_information", True, f"balance={info.get('balance')} {info.get('currency')}")
-
-        symbols = await connection.get_symbols()
-        golds = [s for s in symbols if "XAU" in s.upper()]
-        result["gold_symbols"] = golds
-        step("get_symbols", True, f"{len(symbols)} symbols, gold={golds}")
-
-        if golds:
-            sym = golds[0]
-            price = await connection.get_symbol_price(sym)
-            result["gold_price"] = {"symbol": sym, "bid": price.get("bid"), "ask": price.get("ask")}
-            step("get_symbol_price", True, f"{sym} bid={price.get('bid')} ask={price.get('ask')}")
-
-        result["success"] = True
-    except Exception as e:
-        step("ERROR", False, f"{type(e).__name__}: {e}")
-        result["success"] = False
-        result["traceback"] = traceback.format_exc()[-1500:]
+        return await do(connection)
     finally:
         try:
-            if connection:
-                await connection.close()
+            await connection.close()
         except Exception:
             pass
-    return result
 
 
+def _check_env():
+    if not TOKEN or not ACCOUNT_ID:
+        return {"success": False, "error": "METAAPI_TOKEN or METAAPI_ACCOUNT_ID not set"}
+    return None
+
+
+# --------------------------------------------------------------------------- #
 @app.route("/")
 def home():
     return jsonify({
-        "service": "MetaApi connection test (read-only)",
+        "service": "Stage 1 - single test order",
         "configured": bool(TOKEN and ACCOUNT_ID),
-        "usage": "GET /test to run the one-shot connection check",
+        "symbol": SYMBOL,
+        "endpoints": {
+            "/price": "current XAUUSDm price",
+            "/place_test_order": "place ONE safe buy-limit (won't fill), 24h expiry",
+            "/orders": "list pending orders",
+            "/cancel/<order_id>": "cancel a pending order",
+        },
+        "note": "Test order is a buy-limit ~12% below price, volume 0.01, cannot fill.",
     })
 
 
-@app.route("/test")
-def test():
+@app.route("/price")
+def price():
+    err = _check_env()
+    if err:
+        return jsonify(err), 400
+
+    async def do(c):
+        p = await c.get_symbol_price(symbol=SYMBOL)
+        return {"symbol": SYMBOL, "bid": p.get("bid"), "ask": p.get("ask")}
+
     try:
-        result = asyncio.run(run_connection_test())
-        code = 200 if result.get("success") else 500
-        return jsonify(result), code
+        result = asyncio.run(_with_connection(do))
+        return jsonify({"success": True, **result})
     except Exception as e:
-        return jsonify({"success": False, "fatal": f"{type(e).__name__}: {e}",
+        return jsonify({"success": False, "error": f"{type(e).__name__}: {e}",
+                        "traceback": traceback.format_exc()[-1200:]}), 500
+
+
+@app.route("/place_test_order")
+def place_test_order():
+    err = _check_env()
+    if err:
+        return jsonify(err), 400
+
+    async def do(c):
+        # 1. Read live price
+        p = await c.get_symbol_price(symbol=SYMBOL)
+        ask = p.get("ask")
+        bid = p.get("bid")
+
+        # 2. Compute a SAFE buy-limit far below market (cannot fill)
+        entry = round(bid * (1 - SAFE_DISTANCE_PCT), 2)   # ~12% below
+        risk = round(entry * 0.005, 2)                    # small risk band for the test
+        if risk < 1:
+            risk = 1.0
+        stop = round(entry - risk, 2)                     # below entry
+        target = round(entry + TEST_RR * risk, 2)         # 3R above entry
+
+        # 3. Place the buy-limit with 24h expiry
+        options = {
+            "comment": "JP_STAGE1_TEST",
+            "expiration": {
+                "type": "ORDER_TIME_SPECIFIED",
+                "time": datetime.now(timezone.utc) + timedelta(hours=24),
+            },
+        }
+        result = await c.create_limit_buy_order(
+            symbol=SYMBOL, volume=TEST_VOLUME, open_price=entry,
+            stop_loss=stop, take_profit=target, options=options)
+
+        return {
+            "placed": True,
+            "live_price": {"bid": bid, "ask": ask},
+            "order": {
+                "symbol": SYMBOL,
+                "volume": TEST_VOLUME,
+                "entry_limit": entry,
+                "stop_loss": stop,
+                "take_profit": target,
+                "distance_below_market_pct": SAFE_DISTANCE_PCT * 100,
+            },
+            "result": {
+                "orderId": result.get("orderId"),
+                "stringCode": result.get("stringCode"),
+                "numericCode": result.get("numericCode"),
+            },
+        }
+
+    try:
+        result = asyncio.run(_with_connection(do))
+        return jsonify({"success": True, **result})
+    except Exception as e:
+        return jsonify({"success": False, "error": f"{type(e).__name__}: {e}",
                         "traceback": traceback.format_exc()[-1500:]}), 500
+
+
+@app.route("/orders")
+def orders():
+    err = _check_env()
+    if err:
+        return jsonify(err), 400
+
+    async def do(c):
+        o = await c.get_orders()
+        slim = [{
+            "id": x.get("id"),
+            "type": x.get("type"),
+            "symbol": x.get("symbol"),
+            "openPrice": x.get("openPrice"),
+            "stopLoss": x.get("stopLoss"),
+            "takeProfit": x.get("takeProfit"),
+            "volume": x.get("volume"),
+            "comment": x.get("comment"),
+        } for x in o]
+        return {"count": len(slim), "orders": slim}
+
+    try:
+        result = asyncio.run(_with_connection(do))
+        return jsonify({"success": True, **result})
+    except Exception as e:
+        return jsonify({"success": False, "error": f"{type(e).__name__}: {e}",
+                        "traceback": traceback.format_exc()[-1200:]}), 500
+
+
+@app.route("/cancel/<order_id>")
+def cancel(order_id):
+    err = _check_env()
+    if err:
+        return jsonify(err), 400
+
+    async def do(c):
+        result = await c.cancel_order(order_id=order_id)
+        return {"cancelled": order_id,
+                "stringCode": result.get("stringCode"),
+                "numericCode": result.get("numericCode")}
+
+    try:
+        result = asyncio.run(_with_connection(do))
+        return jsonify({"success": True, **result})
+    except Exception as e:
+        return jsonify({"success": False, "error": f"{type(e).__name__}: {e}",
+                        "traceback": traceback.format_exc()[-1200:]}), 500
 
 
 if __name__ == "__main__":
