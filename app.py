@@ -34,8 +34,11 @@ app = Flask(__name__)
 TOKEN = os.getenv("METAAPI_TOKEN", "")
 ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "")
 
-SYMBOL = "XAUUSDm"          # confirmed gold symbol on this Exness demo
-TEST_VOLUME = 0.01          # smallest lot; fixed for the test (no sizing yet)
+# Test symbol is configurable so we can use a 24/7 instrument (e.g. BTCUSDm)
+# when forex/metals markets are closed on weekends, then switch back to
+# XAUUSDm during market hours. Set TEST_SYMBOL in Railway to override.
+SYMBOL = os.getenv("TEST_SYMBOL", "XAUUSDm")
+TEST_VOLUME = float(os.getenv("TEST_VOLUME", "0.01"))   # smallest lot
 SAFE_DISTANCE_PCT = 0.12    # place limit 12% below price so it can't fill
 TEST_RR = 3.0               # 3R target, matching the strategy
 
@@ -74,13 +77,39 @@ def home():
         "configured": bool(TOKEN and ACCOUNT_ID),
         "symbol": SYMBOL,
         "endpoints": {
-            "/price": "current XAUUSDm price",
+            "/symbols?q=BTC": "search available symbols by substring (find exact name)",
+            "/price": "current price for the configured TEST_SYMBOL",
             "/place_test_order": "place ONE safe buy-limit (won't fill), 24h expiry",
             "/orders": "list pending orders",
             "/cancel/<order_id>": "cancel a pending order",
         },
-        "note": "Test order is a buy-limit ~12% below price, volume 0.01, cannot fill.",
+        "note": f"Test symbol is {SYMBOL} (set TEST_SYMBOL env var to change, "
+                f"e.g. a 24/7 crypto symbol on weekends).",
     })
+
+
+@app.route("/symbols")
+def symbols():
+    """Search available symbols by substring, e.g. /symbols?q=BTC
+    Use this to find the EXACT crypto symbol name before testing on weekends."""
+    err = _check_env()
+    if err:
+        return jsonify(err), 400
+    from flask import request
+    q = (request.args.get("q") or "").upper()
+
+    async def do(c):
+        syms = await c.get_symbols()
+        matches = [s for s in syms if q in s.upper()] if q else syms
+        return {"query": q, "match_count": len(matches), "matches": matches[:50],
+                "total_symbols": len(syms)}
+
+    try:
+        result = asyncio.run(_with_connection(do))
+        return jsonify({"success": True, **result})
+    except Exception as e:
+        return jsonify({"success": False, "error": f"{type(e).__name__}: {e}",
+                        "traceback": traceback.format_exc()[-1200:]}), 500
 
 
 @app.route("/price")
