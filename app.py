@@ -25,6 +25,10 @@ Environment variables (set in Railway, never in code):
 
 import os
 import asyncio
+import time
+import uuid
+import logging
+import threading
 import traceback
 from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify
@@ -32,6 +36,96 @@ from flask import Flask, jsonify
 from sizing import compute_lot_size
 
 app = Flask(__name__)
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("jp-exec")
+
+# --- duplicate-order diagnosis instrumentation ---------------------------- #
+# Every call to a placing endpoint logs an ENTER line with a unique id + the
+# time since the previous call. An in-memory lock blocks a second placement
+# within COOLDOWN seconds, so retries are revealed AND prevented.
+_place_lock = threading.Lock()
+_last_place_ts = [0.0]          # mutable holder
+_place_call_count = [0]
+COOLDOWN_SECONDS = 30           # no two test placements within 30s
+
+# Detector bot that serves /signals (the source of truth for setups)
+BOT_URL = os.getenv("BOT_URL", "https://tv-telegram-bot-bhuc.onrender.com").rstrip("/")
+
+# Signal ids we've already placed this process (id-level duplicate guard).
+_placed_signal_ids = set()
+
+
+def fetch_detector_signals():
+    """Read the detector bot's /signals. Returns (signals_list, error_str)."""
+    import requests
+    try:
+        # Render free tier can cold-start; allow time.
+        r = requests.get(f"{BOT_URL}/signals", timeout=70)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("signals", []), None
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+def assess_signal(sig, spec, price, balance):
+    """Pure logic: given a signal + symbol spec + current price + balance, work
+    out the order type, validate the limit against market, and size it. Places
+    nothing. Returns a dict describing exactly what WOULD be placed (or why not)."""
+    direction = (sig.get("direction") or "").lower()
+    entry = sig.get("entry")
+    stop = sig.get("stop")
+    target = sig.get("target")
+    risk_percent = sig.get("risk_percent") or 0.5
+    bid = price.get("bid")
+    ask = price.get("ask")
+
+    out = {
+        "id": sig.get("id"), "symbol": sig.get("symbol"),
+        "direction": direction, "entry": entry, "stop": stop, "target": target,
+        "risk_percent": risk_percent, "market": {"bid": bid, "ask": ask},
+    }
+
+    if entry is None or stop is None or target is None:
+        out.update(placeable=False, reason="signal missing entry/stop/target")
+        return out
+
+    # direction -> order type + structural sanity check
+    if direction == "bullish":
+        out["order_type"] = "buy_limit"
+        if not (stop < entry < target):
+            out.update(placeable=False, reason="bullish stop<entry<target check failed")
+            return out
+        if entry >= ask:   # buy limit must sit BELOW market
+            out.update(placeable=False,
+                       reason=f"buy-limit entry {entry} not below market ask {ask} "
+                              f"(price moved; signal stale)")
+            return out
+    elif direction == "bearish":
+        out["order_type"] = "sell_limit"
+        if not (target < entry < stop):
+            out.update(placeable=False, reason="bearish target<entry<stop check failed")
+            return out
+        if entry <= bid:   # sell limit must sit ABOVE market
+            out.update(placeable=False,
+                       reason=f"sell-limit entry {entry} not above market bid {bid} "
+                              f"(price moved; signal stale)")
+            return out
+    else:
+        out.update(placeable=False, reason=f"unknown direction '{direction}'")
+        return out
+
+    sizing = compute_lot_size(balance, risk_percent, entry, stop, spec)
+    out["sizing"] = sizing
+    if not sizing.get("ok") or not sizing.get("tradeable"):
+        out.update(placeable=False,
+                   reason="sizing not tradeable: " + str(sizing.get("flag") or sizing.get("error")))
+        return out
+
+    out.update(placeable=True, lot=sizing["lot"], actual_risk=sizing["actual_risk"])
+    return out
 
 TOKEN = os.getenv("METAAPI_TOKEN", "")
 ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "")
@@ -81,6 +175,8 @@ def home():
         "endpoints": {
             "/symbols?q=BTC": "search available symbols by substring (find exact name)",
             "/symbol_spec": "read real broker spec + tick value + demo sizing (read-only)",
+            "/preview_signals": "DRY RUN: what we'd place for each real detector signal (no orders)",
+            "/place_signal/<id>": "place ONE order from a specific detector signal (guarded)",
             "/price": "current price for the configured TEST_SYMBOL",
             "/place_test_order": "place ONE safe buy-limit (won't fill), 24h expiry",
             "/orders": "list pending orders",
@@ -214,49 +310,125 @@ def place_test_order():
     if err:
         return jsonify(err), 400
 
+    # --- diagnosis: log every entry with a unique id and gap since last call
+    req_id = uuid.uuid4().hex[:8]
+    now = time.time()
+    gap = now - _last_place_ts[0]
+    _place_call_count[0] += 1
+    log.info(f"ENTER place_test_order req={req_id} "
+             f"call#={_place_call_count[0]} gap_since_last={gap:.2f}s")
+
+    # --- idempotency guard: block a second placement within the cooldown.
+    # Reveals AND prevents duplicates (returns 'blocked' instead of placing).
+    if not _place_lock.acquire(blocking=False):
+        log.warning(f"BLOCKED req={req_id}: another placement in progress")
+        return jsonify({"success": False, "blocked": True, "req_id": req_id,
+                        "reason": "another placement already in progress"}), 429
+    try:
+        if _last_place_ts[0] > 0 and gap < COOLDOWN_SECONDS:
+            log.warning(f"BLOCKED req={req_id}: only {gap:.2f}s since last "
+                        f"(cooldown {COOLDOWN_SECONDS}s)")
+            return jsonify({"success": False, "blocked": True, "req_id": req_id,
+                            "reason": f"cooldown: {gap:.1f}s since last placement, "
+                                      f"need {COOLDOWN_SECONDS}s",
+                            "hint": "if you only clicked once, a RETRY fired this "
+                                    "request again -> that is the duplicate cause"}), 429
+        _last_place_ts[0] = now
+
+        async def do(c):
+            p = await c.get_symbol_price(symbol=SYMBOL)
+            ask = p.get("ask")
+            bid = p.get("bid")
+
+            entry = round(bid * (1 - SAFE_DISTANCE_PCT), 2)   # ~12% below market
+            risk = round(entry * 0.005, 2)
+            if risk < 1:
+                risk = 1.0
+            stop = round(entry - risk, 2)
+            target = round(entry + TEST_RR * risk, 2)
+
+            options = {
+                "comment": "JP_STAGE1_TEST",
+                "expiration": {
+                    "type": "ORDER_TIME_SPECIFIED",
+                    "time": datetime.now(timezone.utc) + timedelta(hours=24),
+                },
+            }
+            result = await c.create_limit_buy_order(
+                symbol=SYMBOL, volume=TEST_VOLUME, open_price=entry,
+                stop_loss=stop, take_profit=target, options=options)
+
+            return {
+                "placed": True,
+                "req_id": req_id,
+                "live_price": {"bid": bid, "ask": ask},
+                "order": {
+                    "symbol": SYMBOL, "volume": TEST_VOLUME, "entry_limit": entry,
+                    "stop_loss": stop, "take_profit": target,
+                    "distance_below_market_pct": SAFE_DISTANCE_PCT * 100,
+                },
+                "result": {
+                    "orderId": result.get("orderId"),
+                    "stringCode": result.get("stringCode"),
+                    "numericCode": result.get("numericCode"),
+                },
+            }
+
+        try:
+            result = asyncio.run(_with_connection(do))
+            log.info(f"PLACED req={req_id} order={result.get('result',{}).get('orderId')}")
+            return jsonify({"success": True, **result})
+        except Exception as e:
+            log.error(f"ERROR req={req_id}: {e}")
+            return jsonify({"success": False, "req_id": req_id,
+                            "error": f"{type(e).__name__}: {e}",
+                            "traceback": traceback.format_exc()[-1500:]}), 500
+    finally:
+        _place_lock.release()
+
+
+@app.route("/preview_signals")
+def preview_signals():
+    """DRY RUN: read the detector's real signals and show exactly what we WOULD
+    place for each — order type, sized lot, risk, and validity. Places nothing."""
+    err = _check_env()
+    if err:
+        return jsonify(err), 400
+
+    signals, ferr = fetch_detector_signals()
+    if ferr:
+        return jsonify({"success": False, "error": f"could not reach detector: {ferr}"}), 502
+    if not signals:
+        return jsonify({"success": True, "count": 0, "previews": [],
+                        "note": "detector returned no signals"}), 200
+
+    # newest first, look at the most recent few
+    signals = sorted(signals, key=lambda s: s.get("timestamp", ""), reverse=True)[:8]
+
     async def do(c):
-        # 1. Read live price
-        p = await c.get_symbol_price(symbol=SYMBOL)
-        ask = p.get("ask")
-        bid = p.get("bid")
-
-        # 2. Compute a SAFE buy-limit far below market (cannot fill)
-        entry = round(bid * (1 - SAFE_DISTANCE_PCT), 2)   # ~12% below
-        risk = round(entry * 0.005, 2)                    # small risk band for the test
-        if risk < 1:
-            risk = 1.0
-        stop = round(entry - risk, 2)                     # below entry
-        target = round(entry + TEST_RR * risk, 2)         # 3R above entry
-
-        # 3. Place the buy-limit with 24h expiry
-        options = {
-            "comment": "JP_STAGE1_TEST",
-            "expiration": {
-                "type": "ORDER_TIME_SPECIFIED",
-                "time": datetime.now(timezone.utc) + timedelta(hours=24),
-            },
-        }
-        result = await c.create_limit_buy_order(
-            symbol=SYMBOL, volume=TEST_VOLUME, open_price=entry,
-            stop_loss=stop, take_profit=target, options=options)
-
-        return {
-            "placed": True,
-            "live_price": {"bid": bid, "ask": ask},
-            "order": {
-                "symbol": SYMBOL,
-                "volume": TEST_VOLUME,
-                "entry_limit": entry,
-                "stop_loss": stop,
-                "take_profit": target,
-                "distance_below_market_pct": SAFE_DISTANCE_PCT * 100,
-            },
-            "result": {
-                "orderId": result.get("orderId"),
-                "stringCode": result.get("stringCode"),
-                "numericCode": result.get("numericCode"),
-            },
-        }
+        info = await c.get_account_information()
+        balance = info.get("balance")
+        previews = []
+        for sig in signals:
+            sym = sig.get("symbol") or SYMBOL
+            try:
+                spec_raw = await c.get_symbol_specification(symbol=sym)
+                price = await c.get_symbol_price(symbol=sym)
+                spec = {
+                    "tick_size": spec_raw.get("tickSize"),
+                    "tick_value": price.get("lossTickValue"),
+                    "contract_size": spec_raw.get("contractSize"),
+                    "min_volume": spec_raw.get("minVolume"),
+                    "max_volume": spec_raw.get("maxVolume"),
+                    "volume_step": spec_raw.get("volumeStep"),
+                }
+                a = assess_signal(sig, spec, price, balance)
+                a["already_placed"] = sig.get("id") in _placed_signal_ids
+                previews.append(a)
+            except Exception as e:
+                previews.append({"id": sig.get("id"), "placeable": False,
+                                 "reason": f"assess error: {type(e).__name__}: {e}"})
+        return {"balance": balance, "count": len(previews), "previews": previews}
 
     try:
         result = asyncio.run(_with_connection(do))
@@ -264,6 +436,95 @@ def place_test_order():
     except Exception as e:
         return jsonify({"success": False, "error": f"{type(e).__name__}: {e}",
                         "traceback": traceback.format_exc()[-1500:]}), 500
+
+
+@app.route("/place_signal/<signal_id>")
+def place_signal(signal_id):
+    """Place ONE order from a specific detector signal (manual trigger).
+    Guards: 30s cooldown, signal-id dedup, limit-validity, sizing tradeable."""
+    err = _check_env()
+    if err:
+        return jsonify(err), 400
+
+    req_id = uuid.uuid4().hex[:8]
+    now = time.time()
+    gap = now - _last_place_ts[0]
+    log.info(f"ENTER place_signal id={signal_id} req={req_id} gap={gap:.2f}s")
+
+    # id-level duplicate guard
+    if signal_id in _placed_signal_ids:
+        return jsonify({"success": False, "blocked": True, "req_id": req_id,
+                        "reason": f"signal {signal_id} already placed this session"}), 409
+
+    if not _place_lock.acquire(blocking=False):
+        return jsonify({"success": False, "blocked": True, "req_id": req_id,
+                        "reason": "another placement in progress"}), 429
+    try:
+        if _last_place_ts[0] > 0 and gap < COOLDOWN_SECONDS:
+            return jsonify({"success": False, "blocked": True, "req_id": req_id,
+                            "reason": f"cooldown: {gap:.1f}s since last, need {COOLDOWN_SECONDS}s"}), 429
+
+        signals, ferr = fetch_detector_signals()
+        if ferr:
+            return jsonify({"success": False, "error": f"could not reach detector: {ferr}"}), 502
+        sig = next((s for s in (signals or []) if s.get("id") == signal_id), None)
+        if not sig:
+            return jsonify({"success": False, "error": f"signal {signal_id} not found"}), 404
+
+        async def do(c):
+            info = await c.get_account_information()
+            balance = info.get("balance")
+            sym = sig.get("symbol") or SYMBOL
+            spec_raw = await c.get_symbol_specification(symbol=sym)
+            price = await c.get_symbol_price(symbol=sym)
+            spec = {
+                "tick_size": spec_raw.get("tickSize"),
+                "tick_value": price.get("lossTickValue"),
+                "contract_size": spec_raw.get("contractSize"),
+                "min_volume": spec_raw.get("minVolume"),
+                "max_volume": spec_raw.get("maxVolume"),
+                "volume_step": spec_raw.get("volumeStep"),
+            }
+            a = assess_signal(sig, spec, price, balance)
+            if not a.get("placeable"):
+                return {"placed": False, "assessment": a,
+                        "reason": a.get("reason")}
+
+            expiry_hours = sig.get("order_expiry_hours") or 24
+            options = {
+                "comment": f"JP_SIG_{signal_id}"[:31],
+                "expiration": {
+                    "type": "ORDER_TIME_SPECIFIED",
+                    "time": datetime.now(timezone.utc) + timedelta(hours=expiry_hours),
+                },
+            }
+            if a["order_type"] == "buy_limit":
+                res = await c.create_limit_buy_order(
+                    symbol=sym, volume=a["lot"], open_price=a["entry"],
+                    stop_loss=a["stop"], take_profit=a["target"], options=options)
+            else:
+                res = await c.create_limit_sell_order(
+                    symbol=sym, volume=a["lot"], open_price=a["entry"],
+                    stop_loss=a["stop"], take_profit=a["target"], options=options)
+
+            return {"placed": True, "assessment": a,
+                    "result": {"orderId": res.get("orderId"),
+                               "stringCode": res.get("stringCode"),
+                               "numericCode": res.get("numericCode")}}
+
+        result = asyncio.run(_with_connection(do))
+        if result.get("placed"):
+            _last_place_ts[0] = now
+            _placed_signal_ids.add(signal_id)
+            log.info(f"PLACED signal {signal_id} order={result.get('result',{}).get('orderId')}")
+        return jsonify({"success": True, "req_id": req_id, **result})
+    except Exception as e:
+        log.error(f"ERROR place_signal {signal_id}: {e}")
+        return jsonify({"success": False, "req_id": req_id,
+                        "error": f"{type(e).__name__}: {e}",
+                        "traceback": traceback.format_exc()[-1500:]}), 500
+    finally:
+        _place_lock.release()
 
 
 @app.route("/orders")
