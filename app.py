@@ -25,6 +25,10 @@ Environment variables (set in Railway, never in code):
 
 import os
 import asyncio
+import time
+import uuid
+import logging
+import threading
 import traceback
 from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify
@@ -32,6 +36,19 @@ from flask import Flask, jsonify
 from sizing import compute_lot_size
 
 app = Flask(__name__)
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("jp-exec")
+
+# --- duplicate-order diagnosis instrumentation ---------------------------- #
+# Every call to a placing endpoint logs an ENTER line with a unique id + the
+# time since the previous call. An in-memory lock blocks a second placement
+# within COOLDOWN seconds, so retries are revealed AND prevented.
+_place_lock = threading.Lock()
+_last_place_ts = [0.0]          # mutable holder
+_place_call_count = [0]
+COOLDOWN_SECONDS = 30           # no two test placements within 30s
 
 TOKEN = os.getenv("METAAPI_TOKEN", "")
 ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "")
@@ -214,56 +231,81 @@ def place_test_order():
     if err:
         return jsonify(err), 400
 
-    async def do(c):
-        # 1. Read live price
-        p = await c.get_symbol_price(symbol=SYMBOL)
-        ask = p.get("ask")
-        bid = p.get("bid")
+    # --- diagnosis: log every entry with a unique id and gap since last call
+    req_id = uuid.uuid4().hex[:8]
+    now = time.time()
+    gap = now - _last_place_ts[0]
+    _place_call_count[0] += 1
+    log.info(f"ENTER place_test_order req={req_id} "
+             f"call#={_place_call_count[0]} gap_since_last={gap:.2f}s")
 
-        # 2. Compute a SAFE buy-limit far below market (cannot fill)
-        entry = round(bid * (1 - SAFE_DISTANCE_PCT), 2)   # ~12% below
-        risk = round(entry * 0.005, 2)                    # small risk band for the test
-        if risk < 1:
-            risk = 1.0
-        stop = round(entry - risk, 2)                     # below entry
-        target = round(entry + TEST_RR * risk, 2)         # 3R above entry
-
-        # 3. Place the buy-limit with 24h expiry
-        options = {
-            "comment": "JP_STAGE1_TEST",
-            "expiration": {
-                "type": "ORDER_TIME_SPECIFIED",
-                "time": datetime.now(timezone.utc) + timedelta(hours=24),
-            },
-        }
-        result = await c.create_limit_buy_order(
-            symbol=SYMBOL, volume=TEST_VOLUME, open_price=entry,
-            stop_loss=stop, take_profit=target, options=options)
-
-        return {
-            "placed": True,
-            "live_price": {"bid": bid, "ask": ask},
-            "order": {
-                "symbol": SYMBOL,
-                "volume": TEST_VOLUME,
-                "entry_limit": entry,
-                "stop_loss": stop,
-                "take_profit": target,
-                "distance_below_market_pct": SAFE_DISTANCE_PCT * 100,
-            },
-            "result": {
-                "orderId": result.get("orderId"),
-                "stringCode": result.get("stringCode"),
-                "numericCode": result.get("numericCode"),
-            },
-        }
-
+    # --- idempotency guard: block a second placement within the cooldown.
+    # Reveals AND prevents duplicates (returns 'blocked' instead of placing).
+    if not _place_lock.acquire(blocking=False):
+        log.warning(f"BLOCKED req={req_id}: another placement in progress")
+        return jsonify({"success": False, "blocked": True, "req_id": req_id,
+                        "reason": "another placement already in progress"}), 429
     try:
-        result = asyncio.run(_with_connection(do))
-        return jsonify({"success": True, **result})
-    except Exception as e:
-        return jsonify({"success": False, "error": f"{type(e).__name__}: {e}",
-                        "traceback": traceback.format_exc()[-1500:]}), 500
+        if _last_place_ts[0] > 0 and gap < COOLDOWN_SECONDS:
+            log.warning(f"BLOCKED req={req_id}: only {gap:.2f}s since last "
+                        f"(cooldown {COOLDOWN_SECONDS}s)")
+            return jsonify({"success": False, "blocked": True, "req_id": req_id,
+                            "reason": f"cooldown: {gap:.1f}s since last placement, "
+                                      f"need {COOLDOWN_SECONDS}s",
+                            "hint": "if you only clicked once, a RETRY fired this "
+                                    "request again -> that is the duplicate cause"}), 429
+        _last_place_ts[0] = now
+
+        async def do(c):
+            p = await c.get_symbol_price(symbol=SYMBOL)
+            ask = p.get("ask")
+            bid = p.get("bid")
+
+            entry = round(bid * (1 - SAFE_DISTANCE_PCT), 2)   # ~12% below market
+            risk = round(entry * 0.005, 2)
+            if risk < 1:
+                risk = 1.0
+            stop = round(entry - risk, 2)
+            target = round(entry + TEST_RR * risk, 2)
+
+            options = {
+                "comment": "JP_STAGE1_TEST",
+                "expiration": {
+                    "type": "ORDER_TIME_SPECIFIED",
+                    "time": datetime.now(timezone.utc) + timedelta(hours=24),
+                },
+            }
+            result = await c.create_limit_buy_order(
+                symbol=SYMBOL, volume=TEST_VOLUME, open_price=entry,
+                stop_loss=stop, take_profit=target, options=options)
+
+            return {
+                "placed": True,
+                "req_id": req_id,
+                "live_price": {"bid": bid, "ask": ask},
+                "order": {
+                    "symbol": SYMBOL, "volume": TEST_VOLUME, "entry_limit": entry,
+                    "stop_loss": stop, "take_profit": target,
+                    "distance_below_market_pct": SAFE_DISTANCE_PCT * 100,
+                },
+                "result": {
+                    "orderId": result.get("orderId"),
+                    "stringCode": result.get("stringCode"),
+                    "numericCode": result.get("numericCode"),
+                },
+            }
+
+        try:
+            result = asyncio.run(_with_connection(do))
+            log.info(f"PLACED req={req_id} order={result.get('result',{}).get('orderId')}")
+            return jsonify({"success": True, **result})
+        except Exception as e:
+            log.error(f"ERROR req={req_id}: {e}")
+            return jsonify({"success": False, "req_id": req_id,
+                            "error": f"{type(e).__name__}: {e}",
+                            "traceback": traceback.format_exc()[-1500:]}), 500
+    finally:
+        _place_lock.release()
 
 
 @app.route("/orders")
