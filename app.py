@@ -695,6 +695,180 @@ def trade_history():
                         "traceback": traceback.format_exc()[-1500:]}), 500
 
 
+# =========================================================================== #
+# STAGE 4b (DRY) — OUTCOME COMPUTATION (read-only, writes nothing)
+# =========================================================================== #
+# Reads closed JP_SIG positions and COMPUTES what each signal's outcome record
+# should be — outcome, r_result, fill/exit price+time, pnl, lot_size — and
+# returns them. It does NOT write anything anywhere yet. Once you confirm the
+# numbers match reality (the known SL trade should read loss / -1.0R / -49.2),
+# 4b-commit will extend the detector's /update_signal and flip this to write.
+#
+#   GET /sync_outcomes          -> compute outcomes for last 30 days (dry run)
+#   GET /sync_outcomes?days=60  -> custom lookback
+#
+# R math (verified by hand against position 2797990653):
+#   risk_per_unit = |entry_fill - stopLoss|
+#   favorable     = (entry_fill - exit) for SELL, (exit - entry_fill) for BUY
+#   r_result      = favorable / risk_per_unit
+# All values come from the deals themselves; no signal fetch needed to compute.
+# =========================================================================== #
+def _sig_id_from_comment(comment):
+    """'JP_SIG_20260601_164500_b' -> '20260601_164500_b' (None if not ours)."""
+    if comment and comment.startswith("JP_SIG_"):
+        return comment[len("JP_SIG_"):]
+    return None
+
+
+def _vwap(deals, price_key="price", vol_key="volume"):
+    """Volume-weighted average price across a set of deals (handles partials)."""
+    tv = sum((d.get(vol_key) or 0) for d in deals)
+    if tv <= 0:
+        return None, 0.0
+    p = sum((d.get(price_key) or 0) * (d.get(vol_key) or 0) for d in deals) / tv
+    return p, tv
+
+
+def _build_outcomes(deals, hist_orders):
+    """Pure function: turn raw deals/orders into per-signal outcome records."""
+    EPS = 0.10  # |r| below this is treated as breakeven
+
+    # group our deals by positionId
+    by_pos = {}
+    for d in deals:
+        if not _sig_id_from_comment(d.get("comment")):
+            continue
+        pid = d.get("positionId")
+        if pid is None:
+            continue
+        by_pos.setdefault(pid, []).append(d)
+
+    records, skipped_open = [], []
+    seen_positions = set()
+
+    for pid, dl in by_pos.items():
+        seen_positions.add(pid)
+        ins = [d for d in dl if d.get("entryType") == "DEAL_ENTRY_IN"]
+        outs = [d for d in dl if d.get("entryType") == "DEAL_ENTRY_OUT"]
+        sig_id = _sig_id_from_comment((ins or dl)[0].get("comment"))
+
+        if not ins:
+            continue  # no entry deal — nothing to do
+        if not outs:
+            skipped_open.append({"signal_id": sig_id, "positionId": pid,
+                                  "note": "position still open — not settled"})
+            continue
+
+        is_sell = (ins[0].get("type") == "DEAL_TYPE_SELL")
+        entry_px, _ = _vwap(ins)
+        exit_px, exit_vol = _vwap(outs)
+        stop = ins[0].get("stopLoss")
+        lot = sum((d.get("volume") or 0) for d in ins)
+
+        pnl = sum((d.get("profit") or 0) + (d.get("commission") or 0) + (d.get("swap") or 0) for d in dl)
+        pnl = round(pnl, 2)
+
+        # r_result from prices (broker truth)
+        r_result = None
+        if entry_px is not None and exit_px is not None and stop not in (None, 0):
+            risk = abs(entry_px - stop)
+            if risk > 0:
+                favorable = (entry_px - exit_px) if is_sell else (exit_px - entry_px)
+                r_result = round(favorable / risk, 3)
+
+        if r_result is None:
+            outcome = "win" if pnl > 0 else "loss" if pnl < 0 else "breakeven"
+        elif r_result >= EPS:
+            outcome = "win"
+        elif r_result <= -EPS:
+            outcome = "loss"
+        else:
+            outcome = "breakeven"
+
+        exit_reason = (outs[-1].get("reason") or "")
+        records.append({
+            "signal_id": sig_id,
+            "positionId": pid,
+            "order_placed": True,
+            "fill_status": "filled",
+            "fill_price": entry_px,
+            "fill_time": ins[0].get("brokerTime"),
+            "exit_price": exit_px,
+            "exit_time": outs[-1].get("brokerTime"),
+            "lot_size": round(lot, 2),
+            "outcome": outcome,
+            "r_result": r_result,
+            "pnl": pnl,
+            "_exit_reason": exit_reason,  # cross-check only (leading _ = not persisted)
+        })
+
+    # no-fill detection: our orders that ended without ever opening a position
+    DEAD = {"ORDER_STATE_CANCELED", "ORDER_STATE_EXPIRED", "ORDER_STATE_REJECTED"}
+    for o in hist_orders:
+        sig_id = _sig_id_from_comment(o.get("comment"))
+        if not sig_id:
+            continue
+        if o.get("positionId") in seen_positions:
+            continue  # it filled — handled above
+        if o.get("state") in DEAD:
+            records.append({
+                "signal_id": sig_id,
+                "positionId": o.get("positionId"),
+                "order_placed": True,
+                "fill_status": "no-fill",
+                "fill_price": None, "fill_time": None,
+                "exit_price": None, "exit_time": None,
+                "lot_size": None,
+                "outcome": "no-fill",
+                "r_result": 0.0,
+                "pnl": 0.0,
+                "_order_state": o.get("state"),
+            })
+
+    return records, skipped_open
+
+
+@app.route("/sync_outcomes")
+def sync_outcomes():
+    err = _check_env()
+    if err:
+        return jsonify(err), 400
+
+    try:
+        days = int(request.args.get("days", "30"))
+    except ValueError:
+        days = 30
+    days = max(1, min(days, 365))
+
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+
+    async def do(c):
+        deals_resp = await c.get_deals_by_time_range(start, end)
+        orders_resp = await c.get_history_orders_by_time_range(start, end)
+        deals = (deals_resp or {}).get("deals", []) if isinstance(deals_resp, dict) else getattr(deals_resp, "deals", [])
+        hist = (orders_resp or {}).get("historyOrders", []) if isinstance(orders_resp, dict) else getattr(orders_resp, "historyOrders", [])
+        records, open_positions = _build_outcomes(deals, hist)
+        return {
+            "dry_run": True,
+            "note": "computed only — nothing was written",
+            "window": {"days": days, "from": start.isoformat(), "to": end.isoformat()},
+            "settled_count": len(records),
+            "open_unsettled": open_positions,
+            "outcomes": records,
+        }
+
+    try:
+        result = asyncio.run(_with_connection(do))
+        return app.response_class(
+            response=__import__("json").dumps({"success": True, **result}, default=str, indent=2),
+            mimetype="application/json",
+        )
+    except Exception as e:
+        return jsonify({"success": False, "error": f"{type(e).__name__}: {e}",
+                        "traceback": traceback.format_exc()[-1500:]}), 500
+
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
