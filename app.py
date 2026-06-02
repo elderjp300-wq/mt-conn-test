@@ -30,6 +30,7 @@ import uuid
 import logging
 import threading
 import traceback
+import requests
 from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify, request
 
@@ -129,6 +130,11 @@ def assess_signal(sig, spec, price, balance):
 
 TOKEN = os.getenv("METAAPI_TOKEN", "")
 ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "")
+
+# Where to write computed outcomes back (the detector = source of truth) and
+# the shared secret that authorizes broker-field writes. Both set in Railway.
+DETECTOR_URL = os.getenv("DETECTOR_URL", "https://tv-telegram-bot-bhuc.onrender.com").rstrip("/")
+WORKER_TOKEN = os.getenv("WORKER_TOKEN", "")
 
 # Test symbol is configurable so we can use a 24/7 instrument (e.g. BTCUSDm)
 # when forex/metals markets are closed on weekends, then switch back to
@@ -839,6 +845,7 @@ def sync_outcomes():
     except ValueError:
         days = 30
     days = max(1, min(days, 365))
+    commit = request.args.get("commit") in ("1", "true", "yes")
 
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
@@ -849,24 +856,58 @@ def sync_outcomes():
         deals = (deals_resp or {}).get("deals", []) if isinstance(deals_resp, dict) else getattr(deals_resp, "deals", [])
         hist = (orders_resp or {}).get("historyOrders", []) if isinstance(orders_resp, dict) else getattr(orders_resp, "historyOrders", [])
         records, open_positions = _build_outcomes(deals, hist)
-        return {
-            "dry_run": True,
-            "note": "computed only — nothing was written",
+        return records, open_positions
+
+    try:
+        records, open_positions = asyncio.run(_with_connection(do))
+
+        write_results = None
+        if commit:
+            write_results = _commit_outcomes(records)
+
+        payload = {
+            "success": True,
+            "dry_run": not commit,
+            "note": ("written to detector" if commit else "computed only — nothing was written"),
             "window": {"days": days, "from": start.isoformat(), "to": end.isoformat()},
             "settled_count": len(records),
             "open_unsettled": open_positions,
             "outcomes": records,
         }
-
-    try:
-        result = asyncio.run(_with_connection(do))
+        if write_results is not None:
+            payload["writes"] = write_results
         return app.response_class(
-            response=__import__("json").dumps({"success": True, **result}, default=str, indent=2),
+            response=__import__("json").dumps(payload, default=str, indent=2),
             mimetype="application/json",
         )
     except Exception as e:
         return jsonify({"success": False, "error": f"{type(e).__name__}: {e}",
                         "traceback": traceback.format_exc()[-1500:]}), 500
+
+
+def _commit_outcomes(records):
+    """POST each computed outcome to the detector's /update_signal. Only the
+    persisted execution fields are sent (keys starting with _ are dropped).
+    Idempotent: re-sending the same outcome merely re-writes identical values."""
+    if not DETECTOR_URL or not WORKER_TOKEN:
+        return [{"error": "DETECTOR_URL or WORKER_TOKEN not set on the worker"}]
+    PERSIST = {"order_placed", "fill_status", "fill_price", "fill_time",
+               "outcome", "exit_price", "exit_time", "r_result", "lot_size", "pnl"}
+    results = []
+    for rec in records:
+        sid = rec.get("signal_id")
+        body = {"id": sid}
+        body.update({k: v for k, v in rec.items() if k in PERSIST})
+        try:
+            r = requests.post(
+                f"{DETECTOR_URL}/update_signal",
+                headers={"Content-Type": "application/json", "X-Worker-Token": WORKER_TOKEN},
+                json=body, timeout=20)
+            results.append({"signal_id": sid, "status": r.status_code,
+                            "ok": r.ok, "resp": r.text[:200]})
+        except Exception as e:
+            results.append({"signal_id": sid, "ok": False, "error": f"{type(e).__name__}: {e}"})
+    return results
 
 
 if __name__ == "__main__":
