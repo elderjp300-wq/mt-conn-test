@@ -131,6 +131,129 @@ def assess_signal(sig, spec, price, balance):
 TOKEN = os.getenv("METAAPI_TOKEN", "")
 ACCOUNT_ID = os.getenv("METAAPI_ACCOUNT_ID", "")
 
+# =========================================================================== #
+# STAGE 5a — READ-ONLY WATCHER LOOP
+# =========================================================================== #
+# A background thread polls the detector on a timer and LOGS what it WOULD
+# auto-place for each fresh, valid signal. It places NOTHING. This is the safe
+# first step toward autonomy: it proves the loop sees new signals and that the
+# selection/validity logic behaves, with zero broker risk.
+#
+# Controls (Railway env vars):
+#   WATCHER_ENABLED   "true" to run the loop at all (default false -> off)
+#   WATCHER_INTERVAL  seconds between polls (default 120)
+#
+# IMPORTANT: there is no placement here. Arming actual auto-placement is a
+# separate, later step (5b) and will use the DURABLE order_placed flag in
+# Supabase for idempotency — NOT the in-memory set, which a restart would wipe.
+# =========================================================================== #
+
+WATCHER_ENABLED = os.getenv("WATCHER_ENABLED", "false").lower() == "true"
+try:
+    WATCHER_INTERVAL = max(30, int(os.getenv("WATCHER_INTERVAL", "120")))
+except ValueError:
+    WATCHER_INTERVAL = 120
+
+# Last evaluation snapshot, surfaced via /watcher_status (no log digging needed).
+_watcher_state = {
+    "enabled": WATCHER_ENABLED,
+    "interval": WATCHER_INTERVAL,
+    "running": False,
+    "last_run": None,
+    "last_error": None,
+    "runs": 0,
+    "last_evaluation": [],   # list of {id, would_place, reason/lot}
+}
+_watcher_started = False
+
+
+def _watcher_tick():
+    """One read-only pass: fetch signals, assess each, record what we WOULD do."""
+    from datetime import datetime, timezone
+    signals, ferr = fetch_detector_signals()
+    if ferr:
+        _watcher_state["last_error"] = f"fetch: {ferr}"
+        log.warning(f"[watcher] could not reach detector: {ferr}")
+        return
+    if not signals:
+        _watcher_state["last_evaluation"] = []
+        _watcher_state["last_error"] = None
+        log.info("[watcher] detector returned no signals")
+        return
+
+    signals = sorted(signals, key=lambda s: s.get("timestamp", ""), reverse=True)[:8]
+
+    async def do(c):
+        info = await c.get_account_information()
+        balance = info.get("balance")
+        evals = []
+        for sig in signals:
+            sym = sig.get("symbol") or SYMBOL
+            try:
+                spec_raw = await c.get_symbol_specification(symbol=sym)
+                price = await c.get_symbol_price(symbol=sym)
+                spec = {
+                    "tick_size": spec_raw.get("tickSize"),
+                    "tick_value": price.get("lossTickValue"),
+                    "contract_size": spec_raw.get("contractSize"),
+                    "min_volume": spec_raw.get("minVolume"),
+                    "max_volume": spec_raw.get("maxVolume"),
+                    "volume_step": spec_raw.get("volumeStep"),
+                }
+                a = assess_signal(sig, spec, price, balance)
+                # durable signal of prior placement, plus the in-memory guard
+                already = bool(sig.get("order_placed")) or (sig.get("id") in _placed_signal_ids)
+                would_place = bool(a.get("placeable")) and not already
+                evals.append({
+                    "id": sig.get("id"),
+                    "would_place": would_place,
+                    "already_placed": already,
+                    "placeable": a.get("placeable"),
+                    "reason": a.get("reason"),
+                    "lot": a.get("lot"),
+                    "order_type": a.get("order_type"),
+                })
+            except Exception as e:
+                evals.append({"id": sig.get("id"), "would_place": False,
+                              "reason": f"assess error: {type(e).__name__}: {e}"})
+        return evals
+
+    try:
+        evals = asyncio.run(_with_connection(do))
+        _watcher_state["last_evaluation"] = evals
+        _watcher_state["last_error"] = None
+        _watcher_state["last_run"] = datetime.now(timezone.utc).isoformat()
+        _watcher_state["runs"] += 1
+        wp = [e["id"] for e in evals if e.get("would_place")]
+        if wp:
+            log.info(f"[watcher] WOULD place (dry-run, nothing sent): {wp}")
+        else:
+            log.info(f"[watcher] nothing new to place across {len(evals)} signals")
+    except Exception as e:
+        _watcher_state["last_error"] = f"{type(e).__name__}: {e}"
+        log.warning(f"[watcher] tick error: {e}")
+
+
+def _watcher_loop():
+    log.info(f"[watcher] read-only loop started (interval {WATCHER_INTERVAL}s)")
+    _watcher_state["running"] = True
+    while True:
+        try:
+            _watcher_tick()
+        except Exception as e:
+            log.warning(f"[watcher] loop guard caught: {e}")
+        time.sleep(WATCHER_INTERVAL)
+
+
+def _maybe_start_watcher():
+    """Start the loop once, only if enabled. Safe under gunicorn --workers 1."""
+    global _watcher_started
+    if _watcher_started or not WATCHER_ENABLED:
+        return
+    _watcher_started = True
+    t = threading.Thread(target=_watcher_loop, daemon=True)
+    t.start()
+
 # Where to write computed outcomes back (the detector = source of truth) and
 # the shared secret that authorizes broker-field writes. Both set in Railway.
 DETECTOR_URL = os.getenv("DETECTOR_URL", "https://tv-telegram-bot-bhuc.onrender.com").rstrip("/")
@@ -908,6 +1031,23 @@ def _commit_outcomes(records):
         except Exception as e:
             results.append({"signal_id": sid, "ok": False, "error": f"{type(e).__name__}: {e}"})
     return results
+
+
+@app.route("/watcher_status")
+def watcher_status():
+    """Read-only view of the Stage 5a watcher: whether it's enabled, when it last
+    ran, and what it last evaluated (what it WOULD place). Places nothing."""
+    return jsonify({
+        "success": True,
+        "stage": "5a (read-only watcher)",
+        "places_orders": False,
+        **_watcher_state,
+    })
+
+
+# Start the read-only watcher at import time so it runs under gunicorn.
+# No-op unless WATCHER_ENABLED=true. Never places orders (Stage 5a).
+_maybe_start_watcher()
 
 
 if __name__ == "__main__":
