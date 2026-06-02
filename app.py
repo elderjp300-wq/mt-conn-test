@@ -154,41 +154,125 @@ try:
 except ValueError:
     WATCHER_INTERVAL = 120
 
+# --- Stage 5b placement controls (all conservative defaults) -------------- #
+# AUTO_PLACE gates real placement. Ships OFF: deploying 5b changes nothing
+# until you explicitly set AUTO_PLACE=true. Mirrors how WATCHER_ENABLED works.
+AUTO_PLACE = os.getenv("AUTO_PLACE", "false").lower() == "true"
+try:
+    MAX_OPEN_AUTO = max(1, int(os.getenv("MAX_OPEN_AUTO", "1")))   # concurrent cap
+except ValueError:
+    MAX_OPEN_AUTO = 1
+try:
+    MAX_PLACES_PER_DAY = max(1, int(os.getenv("MAX_PLACES_PER_DAY", "5")))
+except ValueError:
+    MAX_PLACES_PER_DAY = 5
+
+# Runtime kill-switch (toggled via /watcher/pause and /watcher/resume — no
+# redeploy needed). When paused, the loop reverts to read-only evaluation.
+_place_paused = [False]
+# Backlog snapshot: ids present when the loop first armed -> never auto-placed.
+_backlog_ids = set()
+_backlog_captured = [False]
+# Daily placement ledger: {"date": "YYYY-MM-DD", "count": n}
+_places_today = {"date": None, "count": 0}
+
 # Last evaluation snapshot, surfaced via /watcher_status (no log digging needed).
 _watcher_state = {
     "enabled": WATCHER_ENABLED,
     "interval": WATCHER_INTERVAL,
+    "auto_place": AUTO_PLACE,
+    "max_open_auto": MAX_OPEN_AUTO,
+    "max_places_per_day": MAX_PLACES_PER_DAY,
     "running": False,
+    "paused": False,
     "last_run": None,
     "last_error": None,
     "runs": 0,
-    "last_evaluation": [],   # list of {id, would_place, reason/lot}
+    "backlog_count": 0,
+    "places_today": 0,
+    "last_placed": None,        # {id, orderId, at}
+    "last_evaluation": [],      # list of {id, would_place, reason/lot}
 }
 _watcher_started = False
 
 
-def _watcher_tick():
-    """One read-only pass: fetch signals, assess each, record what we WOULD do."""
+def _mark_placed_durably(signal_id, order_id):
+    """Persist order_placed=true to the detector (Supabase) so a restart never
+    re-places this signal. Reuses the Stage 4b worker-token write path."""
+    if not DETECTOR_URL or not WORKER_TOKEN:
+        log.warning("[watcher] cannot mark placed: DETECTOR_URL/WORKER_TOKEN unset")
+        return
+    try:
+        requests.post(
+            f"{DETECTOR_URL}/update_signal",
+            headers={"Content-Type": "application/json", "X-Worker-Token": WORKER_TOKEN},
+            json={"id": signal_id, "order_placed": True}, timeout=20)
+    except Exception as e:
+        log.warning(f"[watcher] mark-placed failed for {signal_id}: {e}")
+
+
+def _outstanding_auto_count(c_positions, c_orders):
+    """Count JP_SIG_ items currently OUTSTANDING — open positions PLUS pending
+    limit orders. 'Outstanding' is the right unit for the concurrency cap: a
+    pending limit will become exposure when it fills, so it counts too."""
+    n = 0
+    for p in (c_positions or []):
+        if (p.get("comment") or "").startswith("JP_SIG_"):
+            n += 1
+    for o in (c_orders or []):
+        if (o.get("comment") or "").startswith("JP_SIG_"):
+            n += 1
+    return n
+
+
+def _today_str():
     from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _places_today_count():
+    if _places_today["date"] != _today_str():
+        _places_today["date"] = _today_str()
+        _places_today["count"] = 0
+    return _places_today["count"]
+
+
+def _watcher_tick():
+    """One pass. ALWAYS evaluates read-only. PLACES only when armed (AUTO_PLACE),
+    not paused, the signal is genuinely new (not backlog, not already placed),
+    and every cap/guard passes. Places at most ONE signal per tick."""
+    from datetime import datetime, timezone, timedelta
     signals, ferr = fetch_detector_signals()
     if ferr:
         _watcher_state["last_error"] = f"fetch: {ferr}"
         log.warning(f"[watcher] could not reach detector: {ferr}")
         return
-    if not signals:
-        _watcher_state["last_evaluation"] = []
-        _watcher_state["last_error"] = None
-        log.info("[watcher] detector returned no signals")
-        return
+    signals = signals or []
 
-    signals = sorted(signals, key=lambda s: s.get("timestamp", ""), reverse=True)[:8]
+    # Capture the backlog ONCE, the first time we run while armed. Everything
+    # that exists at that moment is backlog -> never auto-placed (JP's rule).
+    if AUTO_PLACE and not _backlog_captured[0]:
+        for s in signals:
+            if s.get("id"):
+                _backlog_ids.add(s["id"])
+        _backlog_captured[0] = True
+        _watcher_state["backlog_count"] = len(_backlog_ids)
+        log.info(f"[watcher] backlog snapshot captured: {len(_backlog_ids)} signals will NOT be auto-placed")
+
+    ranked = sorted(signals, key=lambda s: s.get("timestamp", ""), reverse=True)[:8]
 
     async def do(c):
         info = await c.get_account_information()
         balance = info.get("balance")
+        positions = await c.get_positions()
+        pending = await c.get_orders()
+        outstanding = _outstanding_auto_count(positions, pending)
+
         evals = []
-        for sig in signals:
+        placement = None
+        for sig in ranked:
             sym = sig.get("symbol") or SYMBOL
+            sid = sig.get("id")
             try:
                 spec_raw = await c.get_symbol_specification(symbol=sym)
                 price = await c.get_symbol_price(symbol=sym)
@@ -201,47 +285,103 @@ def _watcher_tick():
                     "volume_step": spec_raw.get("volumeStep"),
                 }
                 a = assess_signal(sig, spec, price, balance)
-                # durable signal of prior placement, plus the in-memory guard
-                already = bool(sig.get("order_placed")) or (sig.get("id") in _placed_signal_ids)
-                would_place = bool(a.get("placeable")) and not already
+                is_backlog = sid in _backlog_ids
+                already = bool(sig.get("order_placed")) or (sid in _placed_signal_ids)
+                eligible = bool(a.get("placeable")) and not already and not is_backlog
                 evals.append({
-                    "id": sig.get("id"),
-                    "would_place": would_place,
-                    "already_placed": already,
-                    "placeable": a.get("placeable"),
-                    "reason": a.get("reason"),
-                    "lot": a.get("lot"),
-                    "order_type": a.get("order_type"),
+                    "id": sid, "would_place": eligible,
+                    "already_placed": already, "backlog": is_backlog,
+                    "placeable": a.get("placeable"), "reason": a.get("reason"),
+                    "lot": a.get("lot"), "order_type": a.get("order_type"),
                 })
+                # pick the FIRST (freshest) eligible signal as the placement candidate
+                if eligible and placement is None:
+                    placement = (sig, a, sym)
             except Exception as e:
-                evals.append({"id": sig.get("id"), "would_place": False,
+                evals.append({"id": sid, "would_place": False,
                               "reason": f"assess error: {type(e).__name__}: {e}"})
-        return evals
+
+        result = {"evals": evals, "outstanding": outstanding, "placed": None, "skipped": None}
+
+        # ---- placement decision (only if armed + not paused) ----
+        if not (AUTO_PLACE and not _place_paused[0]):
+            result["skipped"] = "read-only (not armed or paused)"
+            return result
+        if placement is None:
+            result["skipped"] = "nothing new+valid to place"
+            return result
+        if outstanding >= MAX_OPEN_AUTO:
+            result["skipped"] = f"concurrency cap: {outstanding} outstanding >= {MAX_OPEN_AUTO}"
+            return result
+        if _places_today_count() >= MAX_PLACES_PER_DAY:
+            result["skipped"] = f"daily cap reached ({MAX_PLACES_PER_DAY})"
+            return result
+
+        sig, a, sym = placement
+        sid = sig.get("id")
+        # serialize with the same lock the manual endpoint uses
+        if not _place_lock.acquire(blocking=False):
+            result["skipped"] = "another placement in progress"
+            return result
+        try:
+            expiry_hours = sig.get("order_expiry_hours") or 24
+            options = {
+                "comment": f"JP_SIG_{sid}"[:31],
+                "expiration": {
+                    "type": "ORDER_TIME_SPECIFIED",
+                    "time": datetime.now(timezone.utc) + timedelta(hours=expiry_hours),
+                },
+            }
+            if a["order_type"] == "buy_limit":
+                res = await c.create_limit_buy_order(
+                    symbol=sym, volume=a["lot"], open_price=a["entry"],
+                    stop_loss=a["stop"], take_profit=a["target"], options=options)
+            else:
+                res = await c.create_limit_sell_order(
+                    symbol=sym, volume=a["lot"], open_price=a["entry"],
+                    stop_loss=a["stop"], take_profit=a["target"], options=options)
+            order_id = res.get("orderId")
+            _placed_signal_ids.add(sid)
+            _last_place_ts[0] = time.time()
+            _places_today["count"] = _places_today_count() + 1
+            result["placed"] = {"id": sid, "orderId": order_id, "lot": a["lot"],
+                                "order_type": a["order_type"]}
+            log.info(f"[watcher] AUTO-PLACED {sid} order={order_id} lot={a['lot']}")
+        finally:
+            _place_lock.release()
+        return result
 
     try:
-        evals = asyncio.run(_with_connection(do))
-        _watcher_state["last_evaluation"] = evals
+        out = asyncio.run(_with_connection(do))
+        _watcher_state["last_evaluation"] = out["evals"]
         _watcher_state["last_error"] = None
         _watcher_state["last_run"] = datetime.now(timezone.utc).isoformat()
         _watcher_state["runs"] += 1
-        wp = [e["id"] for e in evals if e.get("would_place")]
-        if wp:
-            log.info(f"[watcher] WOULD place (dry-run, nothing sent): {wp}")
-        else:
-            log.info(f"[watcher] nothing new to place across {len(evals)} signals")
+        _watcher_state["places_today"] = _places_today_count()
+        if out.get("placed"):
+            p = out["placed"]
+            p["at"] = datetime.now(timezone.utc).isoformat()
+            _watcher_state["last_placed"] = p
+            # mark durably OUTSIDE the connection so a failure here can't block the loop
+            _mark_placed_durably(p["id"], p["orderId"])
+        elif out.get("skipped"):
+            log.info(f"[watcher] no placement: {out['skipped']}")
     except Exception as e:
         _watcher_state["last_error"] = f"{type(e).__name__}: {e}"
         log.warning(f"[watcher] tick error: {e}")
 
 
 def _watcher_loop():
-    log.info(f"[watcher] read-only loop started (interval {WATCHER_INTERVAL}s)")
+    mode = "ARMED (will place)" if AUTO_PLACE else "read-only (no placement)"
+    log.info(f"[watcher] loop started — {mode}, interval {WATCHER_INTERVAL}s, "
+             f"max_open={MAX_OPEN_AUTO}, max/day={MAX_PLACES_PER_DAY}")
     _watcher_state["running"] = True
     while True:
         try:
             _watcher_tick()
         except Exception as e:
             log.warning(f"[watcher] loop guard caught: {e}")
+        _watcher_state["paused"] = _place_paused[0]
         time.sleep(WATCHER_INTERVAL)
 
 
@@ -1035,18 +1175,41 @@ def _commit_outcomes(records):
 
 @app.route("/watcher_status")
 def watcher_status():
-    """Read-only view of the Stage 5a watcher: whether it's enabled, when it last
-    ran, and what it last evaluated (what it WOULD place). Places nothing."""
+    """Read-only view of the watcher: armed/paused state, caps, last run, last
+    evaluation (what it would/did place), and the last auto-placement."""
     return jsonify({
         "success": True,
-        "stage": "5a (read-only watcher)",
-        "places_orders": False,
+        "stage": "5b (autonomous placement, capped)" if AUTO_PLACE else "5b code, read-only (AUTO_PLACE off)",
+        "places_orders": bool(AUTO_PLACE and not _place_paused[0]),
         **_watcher_state,
+        "paused": _place_paused[0],
+        "backlog_captured": _backlog_captured[0],
     })
 
 
-# Start the read-only watcher at import time so it runs under gunicorn.
-# No-op unless WATCHER_ENABLED=true. Never places orders (Stage 5a).
+@app.route("/watcher/pause")
+def watcher_pause():
+    """KILL-SWITCH: stop auto-placement immediately (no redeploy). The loop keeps
+    evaluating read-only; it just won't place until /watcher/resume."""
+    _place_paused[0] = True
+    _watcher_state["paused"] = True
+    log.info("[watcher] PAUSED via kill-switch — placement halted")
+    return jsonify({"success": True, "paused": True,
+                    "note": "auto-placement halted; loop still evaluates read-only"})
+
+
+@app.route("/watcher/resume")
+def watcher_resume():
+    """Re-arm auto-placement after a pause (only matters if AUTO_PLACE=true)."""
+    _place_paused[0] = False
+    _watcher_state["paused"] = False
+    log.info("[watcher] RESUMED via kill-switch")
+    return jsonify({"success": True, "paused": False,
+                    "armed": bool(AUTO_PLACE)})
+
+
+# Start the watcher at import time so it runs under gunicorn.
+# No-op unless WATCHER_ENABLED=true. Placement additionally requires AUTO_PLACE=true.
 _maybe_start_watcher()
 
 
