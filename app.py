@@ -31,7 +31,7 @@ import logging
 import threading
 import traceback
 from datetime import datetime, timedelta, timezone
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 from sizing import compute_lot_size
 
@@ -602,6 +602,97 @@ def cancel(order_id):
     except Exception as e:
         return jsonify({"success": False, "error": f"{type(e).__name__}: {e}",
                         "traceback": traceback.format_exc()[-1200:]}), 500
+
+
+# =========================================================================== #
+# STAGE 4a — OUTCOME READ-BACK: PROBE (read-only)
+# =========================================================================== #
+# Purpose: SEE the real shape MetaApi returns for closed trades, so Stage 4b
+# can be written against verified field names instead of guesses. This endpoint
+# is strictly READ-ONLY: it places nothing, cancels nothing, writes nothing.
+#
+#   GET /trade_history            -> last 7 days of deals + history orders (raw)
+#   GET /trade_history?days=30    -> custom lookback window
+#   GET /trade_history?raw=1      -> return the FULL untouched payload (verbose)
+#
+# What to look for in the output (this is what Stage 4b needs to confirm):
+#   - Does the "comment" field carry "JP_SIG_<id>"? On which deal(s)?
+#   - For a CLOSED position: the entry deal (entryType DEAL_ENTRY_IN) and the
+#     exit deal (DEAL_ENTRY_OUT) — both share the same positionId.
+#   - The "reason" code on the exit deal for an SL-hit vs a TP-hit.
+#   - Where profit / price / volume / time actually live.
+# =========================================================================== #
+@app.route("/trade_history")
+def trade_history():
+    err = _check_env()
+    if err:
+        return jsonify(err), 400
+
+    try:
+        days = int(request.args.get("days", "7"))
+    except ValueError:
+        days = 7
+    days = max(1, min(days, 365))
+    full_raw = request.args.get("raw") in ("1", "true", "yes")
+
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+
+    async def do(c):
+        deals_resp = await c.get_deals_by_time_range(start, end)
+        orders_resp = await c.get_history_orders_by_time_range(start, end)
+
+        # These come back as dict-like models: {"deals":[...], "synchronizing":bool}
+        deals = (deals_resp or {}).get("deals", []) if isinstance(deals_resp, dict) else getattr(deals_resp, "deals", [])
+        hist_orders = (orders_resp or {}).get("historyOrders", []) if isinstance(orders_resp, dict) else getattr(orders_resp, "historyOrders", [])
+
+        # Slim, readable view focused on the fields Stage 4b will use.
+        slim_deals = [{
+            "id": d.get("id"),
+            "type": d.get("type"),
+            "entryType": d.get("entryType"),
+            "symbol": d.get("symbol"),
+            "volume": d.get("volume"),
+            "price": d.get("price"),
+            "profit": d.get("profit"),
+            "commission": d.get("commission"),
+            "swap": d.get("swap"),
+            "positionId": d.get("positionId"),
+            "orderId": d.get("orderId"),
+            "comment": d.get("comment"),
+            "brokerComment": d.get("brokerComment"),
+            "reason": d.get("reason"),
+            "brokerTime": d.get("brokerTime"),
+            "stopLoss": d.get("stopLoss"),
+            "takeProfit": d.get("takeProfit"),
+        } for d in deals]
+
+        # Highlight anything carrying our signal tag, for an at-a-glance check.
+        jp_tagged = [d for d in slim_deals if (d.get("comment") or "").startswith("JP_SIG_")]
+
+        out = {
+            "window": {"from": start.isoformat(), "to": end.isoformat(), "days": days},
+            "counts": {"deals": len(slim_deals), "history_orders": len(hist_orders),
+                       "jp_tagged_deals": len(jp_tagged)},
+            "jp_tagged_deals": jp_tagged,
+            "deals": slim_deals,
+        }
+        if full_raw:
+            # Untouched payloads so we can inspect EVERY field, not just the slim set.
+            out["raw_deals"] = deals
+            out["raw_history_orders"] = hist_orders
+        return out
+
+    try:
+        result = asyncio.run(_with_connection(do))
+        # default=str so datetimes serialize cleanly
+        return app.response_class(
+            response=__import__("json").dumps({"success": True, **result}, default=str, indent=2),
+            mimetype="application/json",
+        )
+    except Exception as e:
+        return jsonify({"success": False, "error": f"{type(e).__name__}: {e}",
+                        "traceback": traceback.format_exc()[-1500:]}), 500
 
 
 if __name__ == "__main__":
