@@ -169,6 +169,22 @@ except ValueError:
 
 # Runtime kill-switch (toggled via /watcher/pause and /watcher/resume — no
 # redeploy needed). When paused, the loop reverts to read-only evaluation.
+# --- Stage 5c: auto-sync outcomes -------------------------------------- #
+# When AUTO_SYNC=true, the loop also reads back closed-trade outcomes on a
+# cadence and writes them to the detector (reusing the Stage 4 path), so you
+# stop running /sync_outcomes?commit=1 by hand. Ships OFF; independent of
+# AUTO_PLACE so you can sync without placing, or place without auto-syncing.
+AUTO_SYNC = os.getenv("AUTO_SYNC", "false").lower() == "true"
+try:
+    # how often to sync, in loop ticks (default: every 5th tick ~ 10 min at 120s)
+    AUTO_SYNC_EVERY = max(1, int(os.getenv("AUTO_SYNC_EVERY", "5")))
+except ValueError:
+    AUTO_SYNC_EVERY = 5
+try:
+    AUTO_SYNC_DAYS = max(1, int(os.getenv("AUTO_SYNC_DAYS", "7")))
+except ValueError:
+    AUTO_SYNC_DAYS = 7
+
 _place_paused = [False]
 # Backlog snapshot: ids present when the loop first armed -> never auto-placed.
 _backlog_ids = set()
@@ -181,6 +197,7 @@ _watcher_state = {
     "enabled": WATCHER_ENABLED,
     "interval": WATCHER_INTERVAL,
     "auto_place": AUTO_PLACE,
+    "auto_sync": AUTO_SYNC,
     "max_open_auto": MAX_OPEN_AUTO,
     "max_places_per_day": MAX_PLACES_PER_DAY,
     "running": False,
@@ -191,6 +208,7 @@ _watcher_state = {
     "backlog_count": 0,
     "places_today": 0,
     "last_placed": None,        # {id, orderId, at}
+    "last_sync": None,          # {at, settled, written}
     "last_evaluation": [],      # list of {id, would_place, reason/lot}
 }
 _watcher_started = False
@@ -371,24 +389,71 @@ def _watcher_tick():
         log.warning(f"[watcher] tick error: {e}")
 
 
+def _auto_sync_tick():
+    """Read closed-trade outcomes and write them to the detector. Reuses the
+    Stage 4 functions verbatim (_build_outcomes + _commit_outcomes). Only writes
+    records that have a settled outcome; idempotent (re-writing identical values
+    is harmless). Returns a small summary for status."""
+    from datetime import datetime, timezone, timedelta
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=AUTO_SYNC_DAYS)
+
+    async def do(c):
+        deals_resp = await c.get_deals_by_time_range(start, end)
+        orders_resp = await c.get_history_orders_by_time_range(start, end)
+        deals = (deals_resp or {}).get("deals", []) if isinstance(deals_resp, dict) else getattr(deals_resp, "deals", [])
+        hist = (orders_resp or {}).get("historyOrders", []) if isinstance(orders_resp, dict) else getattr(orders_resp, "historyOrders", [])
+        return _build_outcomes(deals, hist)
+
+    try:
+        records, _open = asyncio.run(_with_connection(do))
+        # only settled records carry a real outcome; no-fill/win/loss/breakeven
+        settled = [r for r in records if r.get("outcome")]
+        writes = _commit_outcomes(settled) if settled else []
+        ok = sum(1 for w in writes if w.get("ok"))
+        summary = {
+            "at": datetime.now(timezone.utc).isoformat(),
+            "settled": len(settled),
+            "written_ok": ok,
+            "writes": writes[:10],
+        }
+        _watcher_state["last_sync"] = summary
+        log.info(f"[auto-sync] settled={len(settled)} written_ok={ok}")
+        return summary
+    except Exception as e:
+        _watcher_state["last_error"] = f"auto-sync: {type(e).__name__}: {e}"
+        log.warning(f"[auto-sync] error: {e}")
+        return None
+
+
 def _watcher_loop():
     mode = "ARMED (will place)" if AUTO_PLACE else "read-only (no placement)"
-    log.info(f"[watcher] loop started — {mode}, interval {WATCHER_INTERVAL}s, "
+    sync = f"auto-sync every {AUTO_SYNC_EVERY} ticks" if AUTO_SYNC else "auto-sync off"
+    log.info(f"[watcher] loop started — {mode}, {sync}, interval {WATCHER_INTERVAL}s, "
              f"max_open={MAX_OPEN_AUTO}, max/day={MAX_PLACES_PER_DAY}")
     _watcher_state["running"] = True
+    n = 0
     while True:
+        n += 1
         try:
             _watcher_tick()
         except Exception as e:
             log.warning(f"[watcher] loop guard caught: {e}")
+        # auto-sync outcomes on its own cadence (independent of placement)
+        if AUTO_SYNC and (n % AUTO_SYNC_EVERY == 0):
+            try:
+                _auto_sync_tick()
+            except Exception as e:
+                log.warning(f"[auto-sync] loop guard caught: {e}")
         _watcher_state["paused"] = _place_paused[0]
         time.sleep(WATCHER_INTERVAL)
 
 
 def _maybe_start_watcher():
-    """Start the loop once, only if enabled. Safe under gunicorn --workers 1."""
+    """Start the loop once, if the watcher OR auto-sync is enabled. Safe under
+    gunicorn --workers 1 (single process -> single loop)."""
     global _watcher_started
-    if _watcher_started or not WATCHER_ENABLED:
+    if _watcher_started or not (WATCHER_ENABLED or AUTO_SYNC):
         return
     _watcher_started = True
     t = threading.Thread(target=_watcher_loop, daemon=True)
@@ -1179,8 +1244,9 @@ def watcher_status():
     evaluation (what it would/did place), and the last auto-placement."""
     return jsonify({
         "success": True,
-        "stage": "5b (autonomous placement, capped)" if AUTO_PLACE else "5b code, read-only (AUTO_PLACE off)",
+        "stage": "5b+5c (autonomous place + auto-sync)" if (AUTO_PLACE or AUTO_SYNC) else "5b/5c code, read-only",
         "places_orders": bool(AUTO_PLACE and not _place_paused[0]),
+        "auto_sync_on": AUTO_SYNC,
         **_watcher_state,
         "paused": _place_paused[0],
         "backlog_captured": _backlog_captured[0],
